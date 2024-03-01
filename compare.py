@@ -1,0 +1,169 @@
+import xarray as xr
+import numpy as np
+import pandas as pd
+from scipy.stats import ks_2samp
+from scipy.special import kl_div
+#import matplotlib.pyplot as plt
+import os
+
+
+"""
+This module contains functions to load and compare time series data from two different work directories.
+"""
+
+def get_list_of_models_and_scenarios(path):
+    """Get list of models and scenarios from the data directory."""
+    models = []
+    scenarios = []
+    for root, dirs, files in os.walk(path):
+        if "extend" in root:
+            for file in files:
+                if file.startswith("cmip"):
+                    models.append(file.split(".")[3])
+                    scenarios.append(file.split(".")[2])
+        if "new" in root:
+            for file in files:
+                if file.startswith("cs5"):
+                    models.append(file.split(".")[2])
+                    scenarios.append(file.split(".")[1])
+    return list(set(models)), list(set(scenarios))
+
+def get_data_variable(ds):
+    return [ var for var in list(ds.variables) if var not in list(ds.coords)]
+
+def load_ts(wrk, var, mdl=None, scen=None, stage="extend", rename=False):
+    """
+    Load time series data from the work directory at a given stage.
+    Only essentai variables are loaded.
+    Args:
+    wrk: (str) Name of the work directory.
+    var: (str) Name of the variable.
+    mdl: (str) Name of the model.
+    scen: (str) Name of the scenario.
+    stage: (str) Sage of the data (extend, new, obs).
+            obs stage will look for the recalibrated data first.
+    """
+    if stage == "extend":
+        file_var = "x"
+        fn = f"data/{wrk}/out/ts/extend/cmip6.extend.{scen}.{mdl}.{var}.da.ab.nc"
+    elif stage == "new":
+        file_var = "var"
+        fn = f"data/{wrk}/out/new/essential/cs5.{scen}.{mdl}.{var}.da.ab.nc"
+    elif stage == "obs":
+        file_var = "y"
+        fnrecal = f"data/{wrk}/out/ts/obs/era5.{var}.recal.da.ab.nc"
+        if os.path.exists(fnrecal):
+            fn = fnrecal
+        else:
+            fn = f"data/{wrk}/out/ts/obs/era5.{var}.da.ab.nc"
+    
+    
+    if not os.path.exists(fn):
+        raise FileNotFoundError(f"File {fn} not found.")
+    ds = xr.open_dataset(fn)
+    if rename:
+        ds = ds.rename({file_var:var})
+    return ds
+    
+def load_all_models(wrk, var, scen, stage="extend", rename=False, floor=True):
+    """
+    Load time series data from the work directory at a given stage for all models.
+    Args:
+    wrk: (str) Name of the work directory.
+    var: (str) Name of the variable.
+    scen: (str) Name of the scenario.
+    stage: (str) Sage of the data (extend, new, obs).
+    """
+    ds = {}
+    if stage == "obs":
+        ds["ERA5"] = load_ts(wrk, var, stage=stage, rename=rename)
+    else:
+        for mdl in MODELS:
+            try: ds[mdl] = load_ts(wrk, var, mdl, scen, stage=stage, rename=rename)
+            except: continue
+            if floor:
+                ds[mdl]["time"] = ds[mdl]["time"].dt.floor("D")
+    return xr.concat(ds.values(), dim=pd.Index(ds.keys(), name="model"))
+
+def load_all_models_and_scenarios(wrk, var, stage="extend", rename=False, floor=True):
+    ### Is better to do this as a dict of datasets with the scenario as the key
+    """
+    Load time series data from the work directory at a given stage for all models and scenarios.
+    Args:
+    wrk: (str) Name of the work directory.
+    var: (str) Name of the variable.
+    stage: (str) Sage of the data (extend, new, obs).
+    """
+    ds = {}
+    for scen in SCENARIOS:
+        try: ds[scen] = load_all_models(wrk, var, scen, stage=stage, rename=rename, floor=floor)
+        except: continue
+    return xr.concat(ds.values(), dim=pd.Index(ds.keys(), name="scenario"))
+
+def load_variables(wrk, variables, scen=None, stage="extend", rename=True, floor=True):
+    """
+    Load time series data from the work directory at a given stage for all models.
+    Args:
+    wrk: (str) Name of the work directory.
+    variables: (list) List of variable names.
+    scen: (str) Name of the scenario.
+    stage: (str) Sage of the data (extend, new, obs).
+    """
+    ds = []
+    for var in variables:
+        try: ds.append(load_all_models(wrk, var, scen, stage=stage, rename=rename, floor=floor))
+        except: continue
+    return xr.merge(ds)[variables]
+
+# Metrics to compute
+# - Mean absolute error
+# - Kolmogorov-Smirnov test
+
+def compute_mae(ds1, ds2):
+    """
+    Compute the mean absolute error between two datasets over time.
+    """
+    return (ds2 - ds1).apply(np.fabs).mean("time").to_pandas().drop(columns=["lat","lon"])
+
+def compute_ks(ds1, ds2, return_pvalues=False):
+    """
+    Compute the Kolmogorov-Smirnov test between two datasets over time.
+    """
+    results = {}
+    presults = {}
+    for var in get_data_variable(ds1):
+        results[var] = {}
+        presults[var] = {}
+        for mdl in ds1.model.values:
+            ds1_sel = ds1[var].sel({"model":mdl}).values
+            ds2_sel = ds2[var].sel({"model":mdl}).values
+            if np.isnan(ds1_sel).all() or np.isnan(ds2_sel).all():
+                ks,pval = np.nan,np.nan
+            else:
+                ks,pval = ks_2samp(ds1[var].sel({"model":mdl}).values, ds2[var].sel({"model":mdl}).values)
+            results[var][mdl] = ks
+            presults[var][mdl] = pval
+    if return_pvalues:
+        return pd.DataFrame(results), pd.DataFrame(presults)
+    return pd.DataFrame(results)
+
+def compute_kl_div(ds1, ds2):
+    """
+    Compute the Kullback-Leibler divergence between two datasets over time.
+    """
+    results = {}
+    for var in get_data_variable(ds1):
+        results[var] = {}
+        for mdl in ds1.model.values:
+            ds1_sel = ds1[var].sel({"model":mdl}).values
+            ds2_sel = ds2[var].sel({"model":mdl}).values
+            if np.isnan(ds1_sel).all() or np.isnan(ds2_sel).all():
+                kl = np.nan
+            else:
+                kl = kl_div(ds1_sel, ds2_sel)
+            results[var][mdl] = kl
+    return results
+    return pd.DataFrame(results)
+
+MODELS, SCENARIOS = get_list_of_models_and_scenarios("data")
+VARIABLES = ["tas","tasmin","tasmax","pr","wind10","wind100","rhum","rsds"]
