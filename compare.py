@@ -2,7 +2,6 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 from scipy.stats import ks_2samp
-from scipy.special import kl_div
 #import matplotlib.pyplot as plt
 import os
 
@@ -147,23 +146,83 @@ def compute_ks(ds1, ds2, return_pvalues=False):
         return pd.DataFrame(results), pd.DataFrame(presults)
     return pd.DataFrame(results)
 
-def compute_kl_div(ds1, ds2):
-    """
-    Compute the Kullback-Leibler divergence between two datasets over time.
-    """
-    results = {}
-    for var in get_data_variable(ds1):
-        results[var] = {}
-        for mdl in ds1.model.values:
-            ds1_sel = ds1[var].sel({"model":mdl}).values
-            ds2_sel = ds2[var].sel({"model":mdl}).values
-            if np.isnan(ds1_sel).all() or np.isnan(ds2_sel).all():
-                kl = np.nan
-            else:
-                kl = kl_div(ds1_sel, ds2_sel)
-            results[var][mdl] = kl
-    return results
-    return pd.DataFrame(results)
 
 MODELS, SCENARIOS = get_list_of_models_and_scenarios("data")
 VARIABLES = ["tas","tasmin","tasmax","pr","wind10","wind100","rhum","rsds"]
+
+def compare_two_works(work_1, work_2):
+    """
+    Compare two works and return a dictionary with the results.
+    """
+    models_1, scenarios_1 = get_list_of_models_and_scenarios(f"data/{work_1}")
+    models_2, scenarios_2 = get_list_of_models_and_scenarios(f"data/{work_2}")
+
+    print("Check if the models and scenarios are the same...")
+    if models_1 != models_2:
+        raise ValueError("Runs do not have same models.")
+    if scenarios_1 != scenarios_2:
+        raise ValueError("Runs do not have same scenarios.")
+    if models_1 == models_2 and scenarios_1 == scenarios_2:
+        print("Models and scenarios are the same.")
+
+    results = {'obs': {}, 'ext': {}, 'new': {}}
+
+    # Load obs data
+    ds_1_obs = load_variables(work_1, VARIABLES, stage="obs").squeeze()
+    ds_2_obs = load_variables(work_2, VARIABLES, stage="obs").squeeze()
+
+    print("### - CHECKING OBS - ###")
+    mae = compute_mae(ds_1_obs, ds_2_obs)
+    if not (mae.isna() | (mae == 0)).all().all():
+        results["obs"]["mae"] = mae
+    else:
+        print("No differences found.")
+    
+    # Load model data
+    ds_1_ext = { scen: load_variables(work_1, VARIABLES, scen, "extend").squeeze() for scen in SCENARIOS }
+    ds_2_ext = { scen: load_variables(work_2, VARIABLES, scen, "extend").squeeze() for scen in SCENARIOS }
+    ds_1_new = { scen: load_variables(work_1, VARIABLES, scen, "new").squeeze() for scen in SCENARIOS }
+    ds_2_new = { scen: load_variables(work_2, VARIABLES, scen, "new").squeeze() for scen in SCENARIOS }
+
+    for scen in SCENARIOS:
+        print(f"### - CHECKING EXT {scen} - ###")
+        results["ext"][scen] = {}
+        mae = compute_mae(ds_1_ext[scen], ds_2_ext[scen])
+        if not (mae.isna() | (mae == 0)).all().all():
+            results["ext"][scen]["mae"] = mae
+        else:
+            print("No differences found.")
+        
+        print(f"### - CHECKING NEW {scen} - ###")
+        results["new"][scen] = {}
+        mae = compute_mae(ds_1_new[scen], ds_2_new[scen])
+        if not (mae.isna() | (mae == 0)).all().all():
+            results["new"][scen]["mae"] = mae
+        else:
+            print("No differences found.")
+
+    if results_is_empty(results):
+        return {}
+    else:
+        return prune_results(results)
+
+def results_is_empty(results):
+    obs_is_empty = results["obs"] == {}
+    ext_is_empty = all([results["ext"][scen] == {} for scen in SCENARIOS])
+    new_is_empty = all([results["new"][scen] == {} for scen in SCENARIOS])
+    if obs_is_empty and ext_is_empty and new_is_empty:
+        return True
+    return False
+
+def prune_results(results):
+    """
+    Prune results with no differences.
+    """
+    results_pruned = {}
+    if results["obs"] != {}:
+        results_pruned["obs"] = results["obs"]
+    if results["ext"] != { scen: {} for scen in SCENARIOS }:
+        results_pruned["ext"] = { scen: results["ext"][scen] for scen in SCENARIOS if results["ext"][scen] != {} }
+    if results["new"] != { scen: {} for scen in SCENARIOS }:
+        results_pruned["new"] = { scen: results["new"][scen] for scen in SCENARIOS if results["new"][scen] != {} }
+    return results_pruned

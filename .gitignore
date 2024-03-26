@@ -4,3 +4,5 @@ __pycache__/
 # data
 data/
 mshop_runs.csv
+setup.config
+*log
